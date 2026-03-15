@@ -140,3 +140,36 @@ html, body, [class*="css"] {
     from { opacity: 0; transform: translateY(16px); }
     to   { opacity: 1; transform: translateY(0); }
 }
+
+@media (max-width: 900px) {
+    .main-title {
+        font-size: 1.8rem;
+    }
+
+    .sub-title {
+        font-size: 0.88rem;
+        margin-bottom: 1.3rem;
+    }
+
+    [data-testid="stMetric"] {
+        padding: 1rem 1rem !important;
+    }
+
+    [data-testid="stSidebar"] .block-container {
+        padding: 1rem 1rem !important;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .main .block-container {
+        animation: none;
+    }
+
+    [data-testid="stMetric"] {
+        transition: none !important;
+    }
+
+    [data-testid="stMetric"]:hover {
+        transform: none;
+    }
+}

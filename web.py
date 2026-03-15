@@ -29,7 +29,41 @@ else:
 
 # --- 1. CÁC HÀM THUẬT TOÁN ---
 
+def validate_columns(df, required_columns, df_name):
+    missing = [col for col in required_columns if col not in df.columns]
+    if missing:
+        raise ValueError(f"Thiếu cột trong {df_name}: {', '.join(missing)}")
+
+
+def build_orders_dataframe(transactions_df):
+    """Chuẩn hóa dữ liệu giao dịch về dạng có order_id để tính mua kèm chính xác hơn."""
+    candidate_order_cols = ["order_id", "transaction_id", "invoice_id", "bill_id"]
+    existing_order_col = next((col for col in candidate_order_cols if col in transactions_df.columns), None)
+
+    if existing_order_col:
+        return transactions_df.with_columns(pl.col(existing_order_col).cast(pl.String).alias("order_id"))
+
+    fallback_cols = [col for col in ["customer_id", "updated_date"] if col in transactions_df.columns]
+    if len(fallback_cols) < 2:
+        raise ValueError(
+            "Không tìm thấy cột định danh đơn hàng. Cần một trong các cột: "
+            "order_id/transaction_id/invoice_id/bill_id, hoặc cặp customer_id + updated_date."
+        )
+
+    return transactions_df.with_columns(
+        pl.concat_str(
+            [
+                pl.col("customer_id").cast(pl.String),
+                pl.lit("_"),
+                pl.col("updated_date").cast(pl.String),
+            ]
+        ).alias("order_id")
+    )
+
 def get_similar_products(target_item_id, items_df, top_n=5, price_tolerance=0.2):
+    required_cols = ["item_id", "sale_status", "category", "price", "category_l1", "category_l2", "category_l3", "brand"]
+    validate_columns(items_df, required_cols, "items")
+
     source_item = items_df.filter(pl.col("item_id") == target_item_id)
     if source_item.is_empty():
         return pl.DataFrame()
@@ -55,29 +89,37 @@ def get_similar_products(target_item_id, items_df, top_n=5, price_tolerance=0.2)
         max_price = base_price * (1 + price_tolerance)
         conditions.append(pl.col("price").is_between(min_price, max_price))
 
+    # Tạo cột diễn giải ngắn gọn để người dùng biết vì sao item được gợi ý.
+    reason_parts = [
+        pl.when(pl.col("category_l3") == source.get("category_l3", "")).then(pl.lit("Cùng category_l3")).otherwise(None),
+        pl.when(pl.col("category_l2") == source.get("category_l2", "")).then(pl.lit("Cùng category_l2")).otherwise(None),
+        pl.when(pl.col("brand") == source.get("brand", "")).then(pl.lit("Cùng thương hiệu")).otherwise(None),
+    ]
+
+    if price_tolerance > 0.0:
+        reason_parts.append(
+            pl.when(pl.col("price").is_between(min_price, max_price))
+            .then(pl.lit("Trong tầm giá"))
+            .otherwise(None)
+        )
+
     similar_items = (
         items_df.filter(pl.all_horizontal(conditions))
         .with_columns(similarity_score=score_expr)
+        .with_columns(recommendation_reason=pl.concat_str(reason_parts, separator=" | ", ignore_nulls=True))
         .filter(pl.col("similarity_score") > 0)
         .sort(by=["similarity_score", "price"], descending=[True, False])
-        .unique(subset=["category"], keep="first", maintain_order=True)
+        .unique(subset=["item_id"], keep="first", maintain_order=True)
         .limit(top_n)
     )
     return similar_items
 
 def get_frequently_bought_together(target_item_id, transactions_df, items_df, top_k=5):
-    # Xử lý ID đơn hàng giả định từ customer_id và ngày mua
-    df_orders = transactions_df.with_columns(
-        pl.col("updated_date").dt.date().alias("order_date")
-    ).with_columns(
-        pl.concat_str([
-            pl.col("customer_id").cast(pl.String),
-            pl.lit("_"),
-            pl.col("order_date").cast(pl.String)
-        ]).alias("order_id")
-    )
+    validate_columns(transactions_df, ["item_id"], "transactions")
+    validate_columns(items_df, ["item_id", "sale_status", "category", "price"], "items")
+    df_orders = build_orders_dataframe(transactions_df)
 
-    total_orders = df_orders.select("order_id").n_unique()
+    total_orders = int(df_orders.select(pl.col("order_id").n_unique().alias("n")).item())
     orders_with_A = df_orders.filter(pl.col("item_id") == target_item_id).select("order_id").unique()
     freq_A = orders_with_A.height
 
@@ -88,7 +130,7 @@ def get_frequently_bought_together(target_item_id, transactions_df, items_df, to
     co_purchases = (
         df_orders.join(orders_with_A, on="order_id", how="inner")
         .filter(pl.col("item_id") != target_item_id)
-        .group_by("item_id").len().rename({"len": "co_purchase_count"})
+        .group_by("item_id").agg(pl.col("order_id").n_unique().alias("co_purchase_count"))
     )
 
     if co_purchases.is_empty():
@@ -101,9 +143,11 @@ def get_frequently_bought_together(target_item_id, transactions_df, items_df, to
     # Tính Lift Score
     fbt_stats = (
         co_purchases.join(freq_B_df, on="item_id", how="inner")
+        .filter(pl.col("freq_B") > 0)
         .with_columns(
             lift_score=(pl.col("co_purchase_count") * total_orders) / (freq_A * pl.col("freq_B"))
         )
+        .with_columns(recommendation_reason=pl.lit("Đồng xuất hiện trong đơn hàng và có Lift > 1"))
         .filter(pl.col("lift_score") > 1.0)
         .sort(["lift_score", "co_purchase_count"], descending=[True, True])
     )
@@ -111,7 +155,7 @@ def get_frequently_bought_together(target_item_id, transactions_df, items_df, to
     result_df = (
         fbt_stats.join(items_df, on="item_id", how="inner")
         .filter(pl.col("sale_status") == 1)
-        .unique(subset=["category"], keep="first", maintain_order=True)
+        .unique(subset=["item_id"], keep="first", maintain_order=True)
         .limit(top_k)
     )
     return result_df
@@ -133,16 +177,33 @@ def load_data():
         
     df_items = pl.read_parquet(path_items)
     df_trans = pl.read_parquet(path_trans)
+
+    validate_columns(
+        df_items,
+        ["item_id", "sale_status", "category", "price", "category_l1", "category_l2", "category_l3", "brand"],
+        "items",
+    )
+    validate_columns(df_trans, ["item_id"], "transactions")
+
     return df_items, df_trans
 
 try:
     items, transactions = load_data()
+except Exception as e:
+    st.error(f"❌ Lỗi tải dữ liệu: {e}")
+    st.stop()
+
+try:
 
     # --- SIDEBAR ---
     st.sidebar.markdown("## ⚙️ Cài đặt gợi ý")
     st.sidebar.markdown("---")
 
-    item_list = items.filter(pl.col("sale_status") == 1)["item_id"].to_list()
+    item_list = sorted(items.filter(pl.col("sale_status") == 1)["item_id"].to_list())
+    if not item_list:
+        st.warning("⚠️ Không có sản phẩm nào đang mở bán để hiển thị gợi ý.")
+        st.stop()
+
     selected_id = st.sidebar.selectbox("🔎 Mã sản phẩm (item_id)", item_list, index=0)
 
     st.sidebar.markdown("---")
@@ -180,7 +241,7 @@ try:
         similar_res = get_similar_products(selected_id, items, top_n=n_results, price_tolerance=tolerance)
         if not similar_res.is_empty():
             st.dataframe(
-                similar_res.select(["item_id", "category", "brand", "price", "similarity_score"]),
+                similar_res.select(["item_id", "category", "brand", "price", "similarity_score", "recommendation_reason"]),
                 use_container_width=True,
                 hide_index=True,
                 column_config={
@@ -191,6 +252,7 @@ try:
                     "similarity_score": st.column_config.ProgressColumn(
                         "Độ tương đồng", min_value=0, max_value=8, format="%d"
                     ),
+                    "recommendation_reason": st.column_config.TextColumn("Lý do gợi ý"),
                 }
             )
         else:
@@ -205,7 +267,7 @@ try:
         fbt_res = get_frequently_bought_together(selected_id, transactions, items, top_k=n_results)
         if not fbt_res.is_empty():
             st.dataframe(
-                fbt_res.select(["item_id", "category", "price", "lift_score", "co_purchase_count"]),
+                fbt_res.select(["item_id", "category", "price", "lift_score", "co_purchase_count", "recommendation_reason"]),
                 use_container_width=True,
                 hide_index=True,
                 column_config={
@@ -214,10 +276,11 @@ try:
                     "price": st.column_config.NumberColumn("Giá (₫)", format="%,.0f"),
                     "lift_score": st.column_config.NumberColumn("Lift Score", format="%.2f"),
                     "co_purchase_count": st.column_config.NumberColumn("Lần mua kèm", format="%d"),
+                    "recommendation_reason": st.column_config.TextColumn("Lý do gợi ý"),
                 }
             )
         else:
             st.info("ℹ️ Sản phẩm này chưa có dữ liệu mua kèm.")
 
 except Exception as e:
-    st.error(f"❌ Lỗi hệ thống: {e}")
+    st.error(f"❌ Lỗi xử lý gợi ý: {e}")
